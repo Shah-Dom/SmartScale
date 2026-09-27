@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-<title>Shahram Scale Monitor</title>
+<title>IF_B2 Scale Monitor</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -371,7 +371,7 @@
 <div class="wrap">
 
   <header>
-    <h1>Shahram <span>Smart Scale</span></h1>
+    <h1>IF_B2 <span>scale monitor</span></h1>
     <div class="status-row">
       <span class="dot" id="statusDot"></span>
       <span id="statusText">disconnected</span>
@@ -384,7 +384,7 @@
   <div class="profile-card">
     <div class="profile-grid">
       <div class="field" style="grid-column: 1 / -1;">
-        <label>Gender</label>
+        <label>Sex (used for the composition formulas below)</label>
         <div class="gender-toggle">
           <button type="button" id="genderMaleBtn">Male</button>
           <button type="button" id="genderFemaleBtn">Female</button>
@@ -392,11 +392,11 @@
       </div>
       <div class="field">
         <label for="heightInput">Height (cm)</label>
-        <input type="number" id="heightInput" min="100" max="250" step="1" value="167" inputmode="numeric">
+        <input type="number" id="heightInput" min="100" max="250" step="1" value="170" inputmode="numeric">
       </div>
       <div class="field">
         <label for="ageInput">Age (years)</label>
-        <input type="number" id="ageInput" min="5" max="120" step="1" value="50" inputmode="numeric">
+        <input type="number" id="ageInput" min="5" max="120" step="1" value="35" inputmode="numeric">
       </div>
       <div class="field" style="grid-column: 1 / -1;">
         <label for="activityInput">Activity level (for daily energy estimate)</label>
@@ -419,7 +419,7 @@
         <div class="readout-value idle" id="weightValue">--.-<span class="readout-unit">kg</span></div>
       </div>
       <div class="readout">
-        <div class="readout-label">bioimpedance</div>
+        <div class="readout-label">bioimpedance <span style="opacity:0.6">(raw, unconfirmed)</span></div>
         <div class="readout-value idle" id="impedanceValue">----<span class="readout-unit">Ω</span></div>
       </div>
     </div>
@@ -431,9 +431,10 @@
   </div>
   <div class="note">
     Body-fat, water, muscle and bone figures are estimated with published bioelectrical-impedance regression
-    equations for the general adult population (Mifflin-St Jeor for BMR; a resistance-based fat-free-mass/water
-    equation calibrated on adult cohorts). IF_B2's own proprietary calibration constants aren't public, so these
-    numbers are a reasonable clinical-literature estimate rather than a byte-for-byte match to the vendor app.
+    equations for the general adult population (Harris-Benedict, revised 1984, for BMR; a resistance-based
+    fat-free-mass/water equation calibrated on adult cohorts). IF_B2's own proprietary calibration constants
+    aren't public. The impedance value feeding these figures is currently an experimental, unconfirmed guess
+    (see the protocol log) — treat body-fat/water/muscle/bone as rough estimates, not measurements, until verified.
   </div>
 
   <div class="controls">
@@ -472,6 +473,21 @@
   const CONNECT_TIMEOUT_MS = 15000;
   const OP_TIMEOUT_MS = 8000;
   const PROFILE_STORAGE_KEY = 'ifb2-scale-profile-v1';
+
+  // Byte 8-9 read a bit-identical 256 across four separate connections/sessions,
+  // which is the signature of a static flag field, not a live impedance sensor.
+  // Working backward through the FFM/TBW regression below using the vendor app's
+  // own reported body-fat/hydration numbers (28.1% / 49.4% at 78.6kg) implies a
+  // real impedance of roughly 460-590Ω. Byte 15, scaled by ~2.5x, lands in that
+  // band across every logged session so far — promising, but it's a backward fit
+  // from limited data, not a confirmed measurement. Modes:
+  //   'disabled'     - don't compute impedance-dependent metrics at all
+  //   'experimental' - compute them from the byte-15 guess, clearly labeled as such
+  //   'confirmed'    - compute them and present with full confidence
+  // Move to 'confirmed' only once the wet/dry-foot test verifies the source byte.
+  const IMPEDANCE_MODE = 'experimental';
+  const IMPEDANCE_BYTE_OFFSET = 15;     // single byte, not uint16 — see above
+  const IMPEDANCE_SCALE_FACTOR = 2.5;   // back-fit from vendor app comparison, unverified
 
   // ==== DOM refs ===============================================================
   const els = {
@@ -659,8 +675,10 @@
   // not IF_B2's own (undisclosed) firmware constants. See the on-page note.
   //
   // Sources:
-  //  - BMR: Mifflin ST, St Jeor ST, et al. "A new predictive equation for resting
-  //    energy expenditure in healthy individuals." Am J Clin Nutr 1990.
+  //  - BMR: Harris-Benedict, revised by Roza & Shizgal, 1984. (Matched a real
+  //    IF_B2 app reading to within 6 kcal in testing; Mifflin-St Jeor undershot
+  //    the vendor app by ~70 kcal on the same input, so this is the better fit
+  //    for this particular device/app.)
   //  - Fat-free mass / total body water (resistance-based): regression equation
   //    for adults, of the form FFM/TBW = a + b*(height^2/impedance) + c*sex +
   //    d*weight - e*age, as reported in BIA cross-validation literature
@@ -668,7 +686,7 @@
   //  - Bone-mass share and BMI thresholds are population averages / WHO bands,
   //    not a per-user measurement — BIA scales cannot directly measure bone
   //    mineral content, so every vendor app is estimating this too.
-  function computeBodyComposition(weightKg, impedanceOhm, p) {
+  function computeBodyComposition(weightKg, rawImpedanceByte, p) {
     const heightCm = p.heightCm;
     const heightM = heightCm / 100;
     const sexM = p.gender === 'male' ? 1 : 0;
@@ -676,10 +694,17 @@
 
     const bmi = weightKg / (heightM * heightM);
 
-    // Guard against a nonsensical/near-zero impedance reading (bad contact,
-    // corrupted frame) before it produces an absurd or Infinity result.
-    const safeImpedance = (Number.isFinite(impedanceOhm) && impedanceOhm > 50 && impedanceOhm < 1500)
-      ? impedanceOhm
+    // Impedance-dependent metrics are gated by IMPEDANCE_MODE — see the comment
+    // on that constant above. 'disabled' skips these entirely; 'experimental'
+    // computes them from the current best-guess byte but the UI labels the
+    // result as unconfirmed; 'confirmed' presents them normally. rawImpedanceByte
+    // is the single candidate byte the caller already extracted at
+    // IMPEDANCE_BYTE_OFFSET, or null if the frame was too short to contain it.
+    const scaledImpedance = (IMPEDANCE_MODE !== 'disabled' && rawImpedanceByte !== null)
+      ? rawImpedanceByte * IMPEDANCE_SCALE_FACTOR
+      : null;
+    const safeImpedance = (Number.isFinite(scaledImpedance) && scaledImpedance > 200 && scaledImpedance < 1500)
+      ? scaledImpedance
       : null;
 
     let bodyFatPct = null, waterPct = null, musclePct = null, bonePct = null;
@@ -705,8 +730,8 @@
     }
 
     const bmr = sexM
-      ? (10 * weightKg + 6.25 * heightCm - 5 * age + 5)
-      : (10 * weightKg + 6.25 * heightCm - 5 * age - 161);
+      ? (88.362 + 13.397 * weightKg + 4.799 * heightCm - 5.677 * age)
+      : (447.593 + 9.247 * weightKg + 3.098 * heightCm - 4.330 * age);
     const amr = bmr * p.activity;
 
     return { bmi, bodyFatPct, waterPct, musclePct, bonePct, bmr, amr, impedanceRejected: !safeImpedance };
@@ -767,24 +792,29 @@
       </div>`;
   }
 
-  function renderComposition(weightKg, impedanceOhm) {
-    const m = computeBodyComposition(weightKg, impedanceOhm, profile);
+  function renderComposition(weightKg, rawImpedanceByte) {
+    const m = computeBodyComposition(weightKg, rawImpedanceByte, profile);
     let html = renderGauge('BMI', m.bmi, '', 'bmi', profile.gender);
 
     if (m.impedanceRejected) {
       html += `<div class="metric-simple"><span class="metric-name">Body fat / water / muscle / bone</span>
-        <span class="metric-value">unavailable — impedance reading out of range</span></div>`;
+        <span class="metric-value">unavailable — impedance source not confirmed</span></div>`;
     } else {
-      html += renderGauge('Body fat', m.bodyFatPct, '%', 'bodyFat', profile.gender);
-      html += renderGauge('Water', m.waterPct, '%', 'water', profile.gender);
-      html += renderGauge('Muscle', m.musclePct, '%', 'muscle', profile.gender);
-      html += `<div class="metric-simple"><span class="metric-name">Bone mass</span>
+      const caveat = IMPEDANCE_MODE === 'experimental' ? ' (experimental)' : '';
+      html += renderGauge('Body fat' + caveat, m.bodyFatPct, '%', 'bodyFat', profile.gender);
+      html += renderGauge('Water' + caveat, m.waterPct, '%', 'water', profile.gender);
+      html += renderGauge('Muscle' + caveat, m.musclePct, '%', 'muscle', profile.gender);
+      html += `<div class="metric-simple"><span class="metric-name">Bone mass${caveat}</span>
         <span class="metric-value">${m.bonePct.toFixed(1)}<span class="u">%</span></span></div>`;
     }
     html += `<div class="metric-simple"><span class="metric-name">BMR</span>
       <span class="metric-value">${Math.round(m.bmr)}<span class="u">kcal</span></span></div>`;
     html += `<div class="metric-simple"><span class="metric-name">Estimated daily energy (AMR)</span>
       <span class="metric-value">${Math.round(m.amr)}<span class="u">kcal</span></span></div>`;
+
+    if (IMPEDANCE_MODE === 'experimental' && !m.impedanceRejected) {
+      html += `<div class="note" style="padding:10px 0 2px;">Body-fat/water/muscle/bone use an unconfirmed impedance byte (byte 15 × ${IMPEDANCE_SCALE_FACTOR}, back-fit from one vendor-app comparison) — treat as a rough guess, not a measurement, until verified.</div>`;
+    }
 
     els.compositionPanel.innerHTML = html;
   }
@@ -815,32 +845,39 @@
       const rawWeight = value.getUint16(4, /* littleEndian */ true);
       const weightKg = rawWeight / 10;
 
-      // Byte 8-9: candidate bioimpedance field. NOTE: on hardware tested so far this
-      // stayed constant (0x00 0x01 = 256) across repeat readings of the same person,
-      // while bytes 11 and 15 varied — that's a stronger signature of a live sensor
-      // reading than a static field. Treat this value with suspicion until confirmed
-      // against a controlled test (e.g. dry feet vs. damp feet, which should swing a
-      // true impedance reading dramatically).
-      const impedanceOhms = value.getUint16(8, true);
-
-      if (!Number.isFinite(weightKg) || !Number.isFinite(impedanceOhms)) {
-        throw new Error('Parsed values are not finite numbers');
+      if (!Number.isFinite(weightKg)) {
+        throw new Error('Parsed weight is not a finite number');
       }
 
       els.weightValue.innerHTML = `${weightKg.toFixed(1)}<span class="readout-unit">kg</span>`;
-      els.impedanceValue.innerHTML = `${impedanceOhms}<span class="readout-unit">\u03A9</span>`;
       els.weightValue.classList.remove('idle');
-      els.impedanceValue.classList.remove('idle');
 
-      log(`Parsed: weight=${weightKg.toFixed(1)}kg impedance=${impedanceOhms}\u03A9 (impedance offset unconfirmed)`, 'rx');
+      // Candidate impedance source: single byte at IMPEDANCE_BYTE_OFFSET, scaled.
+      // See the comment on IMPEDANCE_MODE above for how this candidate was picked
+      // and why it's still labeled experimental rather than confirmed.
+      const rawImpedanceByte = (IMPEDANCE_BYTE_OFFSET < value.byteLength)
+        ? value.getUint8(IMPEDANCE_BYTE_OFFSET)
+        : null;
+      const scaledImpedanceDisplay = rawImpedanceByte !== null
+        ? Math.round(rawImpedanceByte * IMPEDANCE_SCALE_FACTOR)
+        : null;
 
-      // Byte-indexed map of the two bytes that changed between the two logged reads,
-      // to make it easy to eyeball candidates across further test readings.
+      if (scaledImpedanceDisplay !== null) {
+        els.impedanceValue.innerHTML = `${scaledImpedanceDisplay}<span class="readout-unit">Ω (exp.)</span>`;
+        els.impedanceValue.classList.remove('idle');
+        log(`Parsed: weight=${weightKg.toFixed(1)}kg impedance≈${scaledImpedanceDisplay}Ω (experimental: byte[${IMPEDANCE_BYTE_OFFSET}] × ${IMPEDANCE_SCALE_FACTOR})`, 'rx');
+      } else {
+        log(`Parsed: weight=${weightKg.toFixed(1)}kg (no impedance byte available at this offset)`, 'rx');
+      }
+
+      // Byte-indexed map of the fields that changed across logged sessions so far,
+      // to make it easy to eyeball further candidates in future test readings.
+      const b8pair = value.getUint16(8, true);
       const b11 = value.getUint8(11);
       const b15 = value.getUint8(15);
-      log(`Debug map → byte[8:9]=${impedanceOhms} byte[11]=0x${b11.toString(16).padStart(2, '0')} byte[15]=0x${b15.toString(16).padStart(2, '0')}`, 'sys');
+      log(`Debug map → byte[8:9]=${b8pair} byte[11]=0x${b11.toString(16).padStart(2, '0')} byte[15]=0x${b15.toString(16).padStart(2, '0')}`, 'sys');
 
-      renderComposition(weightKg, impedanceOhms);
+      renderComposition(weightKg, rawImpedanceByte);
     } catch (err) {
       log(`Parse error: ${err.message}`, 'err');
     }
