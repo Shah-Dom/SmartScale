@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-<title>Shahram Smart Scale</title>
+<title>Shahram Scale Monitor</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -467,7 +467,8 @@
   const NOTIFY_CHAR_UUID = 0xFFF1;
   const WRITE_CHAR_UUID = 0xFFF2;
   const HANDSHAKE_FRAME = new Uint8Array([0xFD, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
-  const EXPECTED_NOTIFY_LENGTH = 14;
+  const MEASUREMENT_FRAME_LENGTH = 20; // primary weight+impedance frame, observed on real hardware
+  const STATUS_FRAME_LENGTH = 11;      // secondary frame the scale sends right after — not yet decoded
   const CONNECT_TIMEOUT_MS = 15000;
   const OP_TIMEOUT_MS = 8000;
   const PROFILE_STORAGE_KEY = 'ifb2-scale-profile-v1';
@@ -789,12 +790,23 @@
   }
 
   // ==== Notification handler ===================================================
+  // The scale sends two distinct frame types after a handshake:
+  //  - a 20-byte measurement frame (weight + impedance + fields not yet mapped)
+  //  - an 11-byte frame right after it, purpose currently unknown (ignored, not an error)
+  // Anything else is logged as unexpected so a protocol change is visible immediately.
   function handleNotification(event) {
     const value = event.target.value; // DataView
     log(`RX <- ${bytesToHex(value)} (${value.byteLength} bytes)`, 'rx');
 
-    if (!value || value.byteLength < EXPECTED_NOTIFY_LENGTH) {
-      log(`Ignoring frame: expected ${EXPECTED_NOTIFY_LENGTH} bytes, got ${value ? value.byteLength : 0}`, 'warn');
+    if (!value) return;
+
+    if (value.byteLength === STATUS_FRAME_LENGTH) {
+      log(`Secondary ${STATUS_FRAME_LENGTH}-byte frame (not yet decoded) — ignored`, 'sys');
+      return;
+    }
+
+    if (value.byteLength !== MEASUREMENT_FRAME_LENGTH) {
+      log(`Unexpected frame length: got ${value.byteLength} bytes, expected ${MEASUREMENT_FRAME_LENGTH} or ${STATUS_FRAME_LENGTH}`, 'warn');
       return;
     }
 
@@ -803,7 +815,12 @@
       const rawWeight = value.getUint16(4, /* littleEndian */ true);
       const weightKg = rawWeight / 10;
 
-      // Byte 8-9: raw bioimpedance, little-endian uint16, Ohms
+      // Byte 8-9: candidate bioimpedance field. NOTE: on hardware tested so far this
+      // stayed constant (0x00 0x01 = 256) across repeat readings of the same person,
+      // while bytes 11 and 15 varied — that's a stronger signature of a live sensor
+      // reading than a static field. Treat this value with suspicion until confirmed
+      // against a controlled test (e.g. dry feet vs. damp feet, which should swing a
+      // true impedance reading dramatically).
       const impedanceOhms = value.getUint16(8, true);
 
       if (!Number.isFinite(weightKg) || !Number.isFinite(impedanceOhms)) {
@@ -815,7 +832,13 @@
       els.weightValue.classList.remove('idle');
       els.impedanceValue.classList.remove('idle');
 
-      log(`Parsed: weight=${weightKg.toFixed(1)}kg impedance=${impedanceOhms}\u03A9`, 'rx');
+      log(`Parsed: weight=${weightKg.toFixed(1)}kg impedance=${impedanceOhms}\u03A9 (impedance offset unconfirmed)`, 'rx');
+
+      // Byte-indexed map of the two bytes that changed between the two logged reads,
+      // to make it easy to eyeball candidates across further test readings.
+      const b11 = value.getUint8(11);
+      const b15 = value.getUint8(15);
+      log(`Debug map → byte[8:9]=${impedanceOhms} byte[11]=0x${b11.toString(16).padStart(2, '0')} byte[15]=0x${b15.toString(16).padStart(2, '0')}`, 'sys');
 
       renderComposition(weightKg, impedanceOhms);
     } catch (err) {
